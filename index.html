@@ -1,0 +1,520 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Bonfire</title>
+<link rel="stylesheet" href="vendor/dialkit/styles.css">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; }
+  :fullscreen:not(.tuning) { cursor: none; }
+  #vignette { position: fixed; inset: 0; pointer-events: none; background:
+    radial-gradient(ellipse at 50% 60%, transparent var(--vignette-size), rgba(0, 0, 0, var(--vignette)) 100%),
+    linear-gradient(rgba(0, 0, 0, var(--dim)), rgba(0, 0, 0, var(--dim))); }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "./vendor/three/build/three.module.js",
+  "three/addons/": "./vendor/three/examples/jsm/",
+  "dialkit": "./vendor/dialkit/index.js"
+} }
+</script>
+</head>
+<body>
+<div id="vignette"></div>
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { createDialKit, createDialRoot } from 'dialkit';
+
+// ---- Sound: every .mp3 in assets/sound, found through the server's folder listing ----
+// ponytail: needs a server that lists folders, as `python3 -m http.server` does. Hosted
+// anywhere else, replace this with a hand-written list of files.
+const soundDir = new URL('assets/sound/', location.href);
+const tracks = await fetch(soundDir).then(r => r.text()).then(html =>
+  [...new DOMParser().parseFromString(html, 'text/html').querySelectorAll('a')]
+    .map(a => a.getAttribute('href')).filter(href => /\.mp3$/i.test(href))
+    .map(href => ({ value: new URL(href, soundDir).href, label: decodeURIComponent(href).replace(/\.mp3$/i, '').replaceAll('_', ' ') })),
+  () => []);
+
+// ---- Dials: Space opens the panel, Escape hides it, values autosave to localStorage ----
+// The plate is a generated image, so its lens and scale are guesses to tune by eye.
+const dial = createDialKit('AI Bonfire', {
+  scene: {
+    lens: [50, 30, 80, 1],            // vertical field of view of the plate, degrees
+    eyeHeight: [1.1, 0.4, 3, 0.05],   // camera height in metres; bigger world = less parallax
+    fireX: [0.505, 0.3, 0.7, 0.005],  // where the fire stands in the plate
+    fireY: [0.765, 0.6, 0.95, 0.005],
+    fireSize: [1, 0.3, 2.5, 0.05],
+  },
+  fire: {
+    flameHeight: [2.1, 0.5, 4, 0.1],
+    flameSpeed: [0.75, 0.2, 3, 0.05],
+    core: [0.85, 0.3, 2, 0.05],       // size of the glowing core
+    coreGlow: [0.7, 0, 2, 0.01],      // how opaque and bright the core is
+    haze: [0.1, 0, 0.5, 0.01],        // how far the hot air bends the picture
+    light: [14, 0, 60, 0.5],
+    lightColor: '#ff7b2e',
+    flicker: [0.4, 0, 1, 0.01],
+  },
+  sparks: {
+    amount: [0.1, 0, 1, 0.01],        // share of sparks alive when idle; stoking adds the rest
+    rise: [0.5, 0.1, 3, 0.05],        // metres per second
+    height: [3.5, 1, 8, 0.1],
+    spread: [0.55, 0, 1.5, 0.01],
+    trail: [0.79, 0, 1.5, 0.01],      // seconds of path left glowing behind each spark
+    width: [0.012, 0.002, 0.05, 0.001],
+    glow: [4, 0.5, 10, 0.1],
+  },
+  camera: {
+    drift: [0.15, 0, 0.5, 0.01],
+    mouse: [0.25, 0, 0.6, 0.01],
+  },
+  look: {
+    forest: [0.84, 0, 1.5, 0.01],     // brightness of the painted backdrop
+    dim: [0.13, 0, 0.9, 0.01],        // darkens everything
+    vignette: [0.82, 0, 1, 0.01],
+    vignetteSize: [36, 0, 90, 1],
+    bloom: [1.03, 0, 2, 0.01],
+    bloomRadius: [0.61, 0, 1, 0.01],
+    bloomThreshold: [1.05, 0, 1.5, 0.01],
+  },
+  sound: {
+    ...(tracks.length && { track: { type: 'select', options: tracks, default: tracks[0].value } }),
+    volume: [0.6, 0, 1, 0.01],
+  },
+}, { id: 'bonfire', persist: true });
+// A different track each time the page opens, whatever was saved.
+if (tracks.length) dial.setValue('sound.track', tracks[Math.floor(Math.random() * tracks.length)].value);
+let panel; // DialKit's root; only mounted while tuning, so nothing shows on screen otherwise
+function showPanel(on) {
+  if (on === !!panel) return;
+  if (on) {
+    panel = createDialRoot({ position: 'top-right', theme: 'dark', defaultOpen: true,
+      onOpenChange: open => open || setTimeout(showPanel, 0, false) }); // its own close button
+    dial.setOpen(true); // DialKit remembers a panel it has collapsed
+  } else { panel.destroy(); panel = null; }
+  document.documentElement.classList.toggle('tuning', on);
+}
+
+const rand = Math.random;
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(40, 1, 0.1, 500);
+const renderer = new THREE.WebGLRenderer();
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+document.body.prepend(renderer.domElement);
+
+// ---- Backdrop: three layers pushed back along the camera rays by their depth maps ----
+// front = the full plate, mid = the same scene without the nearest plants, back = without any
+// near trees or plants. Where camera movement would smear a layer across a depth edge, the
+// layer tears open there instead and the one behind shows through.
+// tools/layers.mjs builds the *-data.png files (disparity in R+B, size of the depth jump in G).
+const LAYERS = [ // back to front; step = depth pixels per mesh cell (1 keeps a tear one pixel wide)
+  { image: 'bg.jpg', data: 'back-data.png', step: 4 },
+  { image: 'mid.jpg', data: 'mid-data.png', step: 1, tears: true },
+  { image: 'plate.jpg', data: 'front-data.png', step: 1, tears: true },
+];
+const textures = new THREE.TextureLoader();
+await Promise.all(LAYERS.map(async l => {
+  [l.map, l.dataMap] = await Promise.all([textures.loadAsync('assets/' + l.image), textures.loadAsync('assets/' + l.data)]);
+  l.map.colorSpace = THREE.SRGBColorSpace;
+  l.dataMap.minFilter = THREE.LinearFilter; // mipmaps would blur the thin tear lines away
+  l.dataMap.generateMipmaps = false;
+}));
+const { width: DW, height: DH } = LAYERS[0].dataMap.image;
+const aspect = LAYERS[0].map.image.width / LAYERS[0].map.image.height;
+function disparityOf(img) { // white = near
+  const ctx = Object.assign(document.createElement('canvas'), { width: DW, height: DH }).getContext('2d');
+  ctx.drawImage(img, 0, 0);
+  const px = ctx.getImageData(0, 0, DW, DH).data, d = new Float32Array(DW * DH);
+  for (let i = 0; i < d.length; i++) d[i] = (px[i * 4] * 256 + px[i * 4 + 2]) / 65535;
+  return d;
+}
+LAYERS.forEach(l => l.disparity = disparityOf(l.dataMap.image));
+const ground = LAYERS[0].disparity; // the back layer, where nothing stands on the ground
+const groundAt = (u, v) => ground[Math.round(v * (DH - 1)) * DW + Math.round(u * (DW - 1))];
+
+// The depth maps are only relative. The dirt path down the middle is a flat plane,
+// so two samples on it pin down the scale and where the horizon sits.
+const v1 = 0.95, v2 = 0.72, d1 = groundAt(0.5, v1), d2 = groundAt(0.5, v2);
+const slope = (d1 - d2) / (v1 - v2), vHorizon = v1 - d1 / slope;
+console.assert(slope > 0 && vHorizon > 0.3 && vHorizon < 0.75, 'depth calibration looks wrong', { slope, vHorizon });
+
+// Geometry is built once for a 1 m eye height and a lens with tan(fov/2) = 0.5.
+// Other values are a plain scale of the `world` group: uniform for height, z only for the lens.
+const FAR = 50;
+function layerGeometry(d, step) {
+  const cols = Math.floor((DW - 1) / step), rows = Math.floor((DH - 1) / step);
+  const geo = new THREE.PlaneGeometry(1, 1, cols, rows);
+  const pos = geo.attributes.position.array, uv = geo.attributes.uv.array;
+  for (let j = 0, i = 0; j <= rows; j++) for (let k = 0; k <= cols; k++, i++) {
+    const x = k * step, y = j * step, u = (x + 0.5) / DW, v = (y + 0.5) / DH;
+    const z = Math.min(slope / d[y * DW + x], FAR);
+    pos[i * 3] = (u - 0.5) * aspect * z; pos[i * 3 + 1] = (0.5 - v) * z; pos[i * 3 + 2] = -z;
+    uv[i * 2] = u; uv[i * 2 + 1] = 1 - v;
+  }
+  geo.computeVertexNormals();
+  return geo;
+}
+const tear = { value: 0 }; // how many cells a depth jump of 1 is stretched by; set every frame
+const world = new THREE.Group();
+LAYERS.forEach((l, i) => {
+  const front = i === LAYERS.length - 1; // only the front needs depth; the rest are painted under it
+  // Emissive keeps the painted lighting; the diffuse term lets the fire's light flicker on top of it.
+  l.material = new THREE.MeshLambertMaterial({ map: l.map, emissive: 0xffffff, emissiveMap: l.map, depthTest: front, depthWrite: front });
+  if (l.tears) l.material.onBeforeCompile = shader => {
+    Object.assign(shader.uniforms, { tear, jumps: { value: l.dataMap } });
+    shader.fragmentShader = 'uniform float tear; uniform sampler2D jumps;\n' + shader.fragmentShader.replace('#include <map_fragment>',
+      'if (texture2D(jumps, vMapUv).g * tear > 1.0) discard;\n#include <map_fragment>');
+  };
+  const mesh = new THREE.Mesh(layerGeometry(l.disparity, l.step), l.material);
+  mesh.renderOrder = i - LAYERS.length;
+  world.add(mesh);
+});
+scene.add(world);
+
+// ---- Bonfire ----
+const fire = new THREE.Group();
+scene.add(fire);
+
+function pixelTexture(colors, n = 8) {
+  const c = Object.assign(document.createElement('canvas'), { width: n, height: n }), g = c.getContext('2d');
+  for (let i = 0; i < n * n; i++) {
+    g.fillStyle = colors[Math.floor(rand() * colors.length)];
+    g.fillRect(i % n, Math.floor(i / n), 1, 1);
+  }
+  const t = new THREE.CanvasTexture(c);
+  t.magFilter = THREE.NearestFilter;
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+
+const m = new THREE.Matrix4(), q = new THREE.Quaternion(), v3 = new THREE.Vector3(), up = new THREE.Vector3(), one = new THREE.Vector3(1, 1, 1);
+const UP = new THREE.Vector3(0, 1, 0);
+
+// Seven logs in a star, each a row of four blocks; one points at the camera.
+const CUBE = 0.2, LOGS = 7, LOG_LEN = 4;
+const bark = pixelTexture(['#b08a58', '#c9a26b', '#9a7446', '#d8b47c', '#8a6840']);
+const logs = new THREE.InstancedMesh(new THREE.BoxGeometry(CUBE, CUBE, CUBE),
+  new THREE.MeshLambertMaterial({ map: bark, emissive: 0xffc890, emissiveMap: bark, emissiveIntensity: 0.5 }), LOGS * LOG_LEN);
+for (let i = 0; i < LOGS; i++) for (let j = 0; j < LOG_LEN; j++) {
+  const a = i / LOGS * Math.PI * 2 + Math.PI / 2, r = 0.35 + j * CUBE;
+  m.compose(v3.set(Math.cos(a) * r, CUBE / 2, Math.sin(a) * r), q.setFromAxisAngle(UP, -a), one);
+  logs.setMatrixAt(i * LOG_LEN + j, m);
+}
+fire.add(logs);
+
+// Flames: a disc of square columns whose heights jump in block-sized steps.
+const CELL = 0.1;
+const columns = [];
+for (let x = -4; x <= 4; x++) for (let z = -4; z <= 4; z++) {
+  const r = Math.hypot(x, z) * CELL;
+  if (r <= 0.45) columns.push({ x: x * CELL, z: z * CELL, peak: 1 - (r / 0.5) ** 1.3, a: rand() * 6.28, b: rand() * 6.28, f: 4 + rand() * 5 });
+}
+const flameMat = new THREE.ShaderMaterial({
+  uniforms: { uTop: { value: 1 } },
+  vertexShader: /* glsl */`
+    varying float vY, vShade;
+    void main() {
+      vec4 p = instanceMatrix * vec4(position, 1.0);
+      vY = p.y; vShade = instanceColor.r;
+      gl_Position = projectionMatrix * modelViewMatrix * p;
+    }`,
+  fragmentShader: /* glsl */`
+    uniform float uTop;
+    varying float vY, vShade;
+    void main() {
+      // Coloured by height, one tone per block: glowing yellow at the logs, dark orange at the tips.
+      float up = (floor((vY - 0.001) / ${CELL}) - 0.5) * ${CELL} / uTop;
+      vec3 c = mix(vec3(1.0, 0.72, 0.12), vec3(1.0, 0.24, 0.02), smoothstep(0.0, 0.35, up));
+      gl_FragColor = vec4(mix(c, vec3(0.42, 0.07, 0.01), smoothstep(0.3, 0.8, up)) * vShade, 1.0);
+    }`,
+});
+const flames = new THREE.InstancedMesh(new THREE.BoxGeometry(CELL * 0.9, 1, CELL * 0.9).translate(0, 0.5, 0), flameMat, columns.length);
+columns.forEach((c, i) => flames.setColorAt(i, new THREE.Color().setScalar(0.82 + rand() * 0.3))); // each bar its own shade
+fire.add(flames);
+
+const NOISE = /* glsl */`
+  float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+  float noise(vec2 p) {
+    vec2 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(hash(i), hash(i + vec2(1.0, 0.0)), f.x), mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), f.x), f.y);
+  }`;
+
+// Core: a sheet of glowing blocks that faces the camera, laid half-transparent over the flames
+// so the bars stay visible through it. Its shape is a flame of rising noise, not a solid lump.
+const coreMat = new THREE.ShaderMaterial({
+  uniforms: { uTime: { value: 0 }, uSize: { value: new THREE.Vector2() }, uGlow: { value: 1 } },
+  vertexShader: /* glsl */`
+    uniform vec2 uSize;
+    varying vec2 vUv;
+    void main() {
+      vUv = uv;
+      vec4 p = modelViewMatrix * vec4(0.0, 0.0, 0.0, 1.0);
+      p.xy += vec2(position.x, position.y + 0.5) * uSize; // stands on its origin
+      gl_Position = projectionMatrix * p;
+    }`,
+  fragmentShader: /* glsl */`
+    uniform float uTime, uGlow;
+    varying vec2 vUv;
+    ${NOISE}
+    void main() {
+      vec2 cells = vec2(9.0, 14.0); // the same block size as the bars
+      vec2 c = (min(floor(vUv * cells), cells - 1.0) + 0.5) / cells;
+      float x = abs(c.x - 0.5) * 2.0, y = c.y;
+      float n = noise(vec2(c.x * 6.0, c.y * 5.0 - uTime * 1.7)) + 0.5 * noise(vec2(c.x * 13.0, c.y * 10.0 - uTime * 3.3));
+      float heat = (1.0 - x / (1.0 - pow(y, 1.3))) * (1.15 - 0.6 * y) + (n - 0.75) * 0.6;
+      heat = floor(clamp(heat, 0.0, 1.0) * 5.0) / 5.0; // a few flat tones
+      gl_FragColor = vec4(mix(vec3(1.0, 0.45, 0.08), vec3(1.5, 1.3, 0.75), heat), min(0.9, heat * uGlow));
+    }`,
+  transparent: true, depthTest: false, depthWrite: false,
+});
+const core = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), coreMat);
+core.position.y = CUBE / 2;
+core.frustumCulled = false; // placed in the shader
+core.renderOrder = 1;
+fire.add(core);
+
+// Sparks: each is a ribbon laid along the path it has just flown, so it trails.
+// The path is a pure function of time, so the whole thing lives in the vertex shader.
+const SPARKS = 160, SEGMENTS = 12;
+const strip = [], stripIndex = [];
+for (let k = 0; k <= SEGMENTS; k++) {
+  strip.push(k / SEGMENTS, -1, 0, k / SEGMENTS, 1, 0); // x: 0 at the head, 1 at the tail; y: side
+  if (k < SEGMENTS) stripIndex.push(k * 2, k * 2 + 1, k * 2 + 2, k * 2 + 1, k * 2 + 3, k * 2 + 2);
+}
+const sparkGeo = new THREE.InstancedBufferGeometry();
+sparkGeo.setAttribute('position', new THREE.Float32BufferAttribute(strip, 3));
+sparkGeo.setIndex(stripIndex);
+sparkGeo.setAttribute('seed', new THREE.InstancedBufferAttribute(Float32Array.from({ length: SPARKS * 4 }, rand), 4));
+sparkGeo.instanceCount = SPARKS;
+const sparkMat = new THREE.ShaderMaterial({
+  uniforms: { uTime: { value: 0 }, uAlive: { value: 0 }, uScale: { value: 1 }, uRise: { value: 1 }, uHeight: { value: 1 },
+    uSpread: { value: 1 }, uTrail: { value: 0 }, uWidth: { value: 0 }, uGlow: { value: 1 } },
+  vertexShader: /* glsl */`
+    uniform float uTime, uAlive, uScale, uRise, uHeight, uSpread, uTrail, uWidth;
+    attribute vec4 seed;
+    varying float vHeat;
+
+    vec3 path(float age, vec4 s) {
+      float y = age * uRise * (0.6 + 0.8 * s.y);
+      float k = y / uHeight; // 0 at birth, 1 where it dies
+      float a = s.w * 6.283 + age * (1.2 + 2.0 * s.x);
+      vec2 swirl = vec2(sin(a) + 0.4 * sin(a * 2.7 + s.y * 9.0), cos(a * 0.8 + s.z * 5.0) + 0.4 * cos(a * 2.1));
+      return vec3((s.x - 0.5) * 0.4, 0.5 + y, (s.z - 0.5) * 0.4) + vec3(swirl.x, 0.0, swirl.y) * uSpread * k;
+    }
+    void main() {
+      float life = uHeight / (uRise * (0.6 + 0.8 * seed.y));
+      float t = uTime / life + seed.w * 17.0;
+      vec4 s = fract(seed + floor(t) * vec4(0.37, 0.0, 0.61, 0.23)); // a new path every life
+      float k = fract(t), age = max(0.0, k * life - position.x * uTrail);
+      vec4 p = modelViewMatrix * vec4(path(age, s), 1.0);
+      vec4 ahead = modelViewMatrix * vec4(path(age + 0.03, s), 1.0);
+      vec2 dir = normalize(ahead.xy - p.xy + 1e-5);
+      p.xy += vec2(-dir.y, dir.x) * position.y * uWidth * uScale * (1.0 - 0.6 * position.x);
+      gl_Position = projectionMatrix * p;
+      float tail = 1.0 - position.x;
+      float alive = clamp(uAlive * ${SPARKS}.0 - float(gl_InstanceID), 0.0, 1.0);
+      float twinkle = 0.75 + 0.25 * sin(uTime * 23.0 + seed.x * 100.0);
+      vHeat = tail * tail * smoothstep(0.0, 0.05, k) * (1.0 - k) * alive * twinkle;
+    }`,
+  fragmentShader: /* glsl */`
+    uniform float uGlow;
+    varying float vHeat;
+    void main() {
+      gl_FragColor = vec4(mix(vec3(1.0, 0.18, 0.02), vec3(1.0, 0.75, 0.3), vHeat) * vHeat * uGlow, 1.0);
+    }`,
+  blending: THREE.AdditiveBlending, transparent: true, depthWrite: false,
+});
+const sparks = new THREE.Mesh(sparkGeo, sparkMat);
+sparks.frustumCulled = false; // positions only exist in the shader
+sparks.renderOrder = 2;
+fire.add(sparks);
+
+const light = new THREE.PointLight(0xff7b2e, 0, 0, 2);
+light.position.y = 0.7;
+fire.add(light);
+
+// ---- Post, input, loop ----
+const composer = new EffectComposer(renderer,
+  new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType, samples: 4 }));
+composer.addPass(new RenderPass(scene, camera));
+// Heat haze: bends the picture with rising noise, in and above the flames.
+const haze = new ShaderPass({
+  uniforms: { tDiffuse: { value: null }, uTime: { value: 0 }, uStrength: { value: 0 }, uAspect: { value: 1 },
+    uBase: { value: new THREE.Vector2() }, uReach: { value: new THREE.Vector2() } },
+  vertexShader: /* glsl */`
+    varying vec2 vUv;
+    void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+  fragmentShader: /* glsl */`
+    uniform sampler2D tDiffuse;
+    uniform float uTime, uStrength, uAspect;
+    uniform vec2 uBase, uReach; // foot of the flames on screen; their half-width and height
+    varying vec2 vUv;
+    ${NOISE}
+    void main() {
+      vec2 d = (vUv - uBase) / uReach;
+      // Gentle inside the flames, strongest just above their tips, gone by twice their height.
+      float mask = (1.0 - smoothstep(0.7, 1.8, abs(d.x))) * smoothstep(-0.1, 0.2, d.y)
+        * mix(0.35, 1.0, smoothstep(0.3, 1.0, d.y)) * (1.0 - smoothstep(1.2, 2.4, d.y));
+      vec2 p = vec2(d.x * 2.5, d.y * 7.0 - uTime * 1.3);
+      vec2 push = vec2(noise(p), noise(p + 17.3)) - 0.5 + 0.5 * (vec2(noise(p * 2.3 + 5.1), noise(p * 2.3 + 40.0)) - 0.5);
+      gl_FragColor = texture2D(tDiffuse, vUv + push * mask * uStrength * uReach.x * vec2(1.0, uAspect));
+    }`,
+});
+composer.addPass(haze);
+const bloom = new UnrealBloomPass(new THREE.Vector2(1, 1), 0, 0, 0);
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
+
+// Browsers keep audio silent until the first click or key press.
+const audio = new AudioContext(), volume = audio.createGain();
+volume.connect(audio.destination);
+for (const gesture of ['pointerdown', 'keydown']) addEventListener(gesture, () => audio.resume(), { once: true });
+let source, playing;
+async function play(url) {
+  playing = url;
+  const clip = await audio.decodeAudioData(await (await fetch(url)).arrayBuffer());
+  if (playing !== url) return; // another track was picked while this one loaded
+  // Fold the last second into the first, so the loop has no seam.
+  const fade = Math.min(clip.sampleRate, clip.length >> 2), length = clip.length - fade;
+  const loop = audio.createBuffer(clip.numberOfChannels, length, clip.sampleRate);
+  for (let ch = 0; ch < clip.numberOfChannels; ch++) {
+    const from = clip.getChannelData(ch), to = loop.getChannelData(ch);
+    to.set(from.subarray(0, length));
+    for (let i = 0; i < fade; i++) {
+      const k = i / fade * Math.PI / 2;
+      to[i] = from[i] * Math.sin(k) + from[length + i] * Math.cos(k);
+    }
+  }
+  source?.stop();
+  source = audio.createBufferSource();
+  source.buffer = loop;
+  source.loop = true;
+  source.connect(volume);
+  source.start();
+}
+
+let P;
+const target = new THREE.Vector3();
+const vignette = document.getElementById('vignette');
+// Everything that only changes when a dial or the window does.
+function apply() {
+  const tanV = Math.tan(THREE.MathUtils.degToRad(P.scene.lens) / 2), h = P.scene.eyeHeight;
+  world.scale.set(h, h, h * 0.5 / tanV);
+  const u = P.scene.fireX, v = P.scene.fireY, z = slope / groundAt(u, v);
+  fire.position.set((u - 0.5) * aspect * z, (0.5 - v) * z, -z).multiply(world.scale);
+  fire.quaternion.setFromUnitVectors(UP, up.set(0, 1, (0.5 - vHorizon) * 2 * tanV).normalize()); // ground normal
+  fire.scale.setScalar(P.scene.fireSize * h / 1.2); // grow with the world so the picture stays the same
+  target.set(0, 0, fire.position.z);
+
+  const a = innerWidth / innerHeight;
+  camera.aspect = a;
+  // Stay inside the plate with a margin so camera movement never shows its edge.
+  camera.fov = THREE.MathUtils.radToDeg(2 * Math.atan(Math.min(tanV * 0.84, tanV * aspect * 0.74 / a)));
+  camera.updateProjectionMatrix();
+
+  LAYERS.forEach(l => l.material.emissiveIntensity = P.look.forest);
+  light.color.set(P.fire.lightColor);
+  bloom.strength = P.look.bloom; bloom.radius = P.look.bloomRadius; bloom.threshold = P.look.bloomThreshold;
+  haze.uniforms.uStrength.value = P.fire.haze; haze.uniforms.uAspect.value = a;
+  volume.gain.value = P.sound.volume;
+  if (P.sound.track && P.sound.track !== playing) play(P.sound.track);
+  vignette.style.setProperty('--vignette', P.look.vignette);
+  vignette.style.setProperty('--vignette-size', P.look.vignetteSize + '%');
+  vignette.style.setProperty('--dim', P.look.dim);
+
+  const su = sparkMat.uniforms, sp = P.sparks;
+  su.uScale.value = fire.scale.x;
+  su.uRise.value = sp.rise; su.uHeight.value = sp.height; su.uSpread.value = sp.spread;
+  su.uTrail.value = sp.trail; su.uWidth.value = sp.width; su.uGlow.value = sp.glow;
+}
+dial.subscribe(values => { P = values; apply(); });
+addEventListener('resize', () => {
+  renderer.setSize(innerWidth, innerHeight);
+  composer.setSize(innerWidth, innerHeight);
+  apply();
+});
+dispatchEvent(new Event('resize'));
+
+const mouse = new THREE.Vector2(), look = new THREE.Vector2();
+// A click stokes the fire: a quick flare (to 1), a slow settle (to 0), then a slight lull
+// (down to -0.25) before it is back to normal. `x` is seconds since the click.
+const ease = x => x * x * (3 - 2 * x);
+function stokeAt(x, f) {
+  if (x < f.rise) return f.from + (1 - f.from) * ease(x / f.rise);
+  if ((x -= f.rise) < f.fall) return 1 - ease(x / f.fall);
+  if ((x -= f.fall) < f.lull) return -0.25 * Math.sin(Math.PI * x / f.lull) ** 2;
+  return 0;
+}
+{ const f = { from: 0, rise: 1, fall: 2, lull: 2 };
+  console.assert(stokeAt(1, f) === 1 && stokeAt(3, f) === 0 && stokeAt(4, f) === -0.25 && stokeAt(9, f) === 0, 'stoke envelope is off'); }
+const between = (a, b) => a + rand() * (b - a);
+let flare = { at: -Infinity, from: 0, rise: 0, fall: 0, lull: 0 }; // the last click
+let stoke = 0, flameTime = 0;
+const stokeFire = () => // starts from wherever the fire is now
+  flare = { at: clock.elapsedTime, from: stoke, rise: between(0.35, 0.65), fall: between(3, 5), lull: between(3, 5) };
+// On the canvas only, so working in the panel neither moves the camera nor stokes the fire.
+renderer.domElement.addEventListener('pointermove', e => mouse.set(e.clientX / innerWidth * 2 - 1, 1 - e.clientY / innerHeight * 2));
+renderer.domElement.addEventListener('pointerdown', stokeFire);
+addEventListener('keydown', e => {
+  const typing = e.target.closest('input, textarea, [contenteditable]');
+  if (e.key === 'Shift' && !e.repeat && !e.target.closest('.dialkit-root')) stokeFire(); // Shift in the panel is DialKit's
+  if (e.key === ' ' && !panel) { showPanel(true); e.preventDefault(); }
+  if (e.key === 'Escape' && !typing && !e.defaultPrevented) showPanel(false);
+  if (e.key === 'f' && !typing)
+    document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+});
+
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.1), t = clock.elapsedTime;
+  stoke = stokeAt(t - flare.at, flare);
+  const energy = 1 + 0.6 * stoke;
+  const wobble = 0.5 * Math.sin(t * 11.3) + 0.3 * Math.sin(t * 17.7 + 1.3) + 0.2 * Math.sin(t * 5.1 + 4);
+  const flick = 1 - P.fire.flicker * (0.5 - 0.5 * wobble);
+
+  flameTime += dt * P.fire.flameSpeed;
+  const flameTop = P.fire.flameHeight * energy;
+  flameMat.uniforms.uTop.value = flameTop;
+  columns.forEach((c, i) => {
+    const n = 0.5 + 0.5 * Math.sin(flameTime * c.f + c.a) * Math.sin(flameTime * c.f * 0.43 + c.b);
+    const h = Math.max(CELL, Math.round(flameTop * c.peak * (0.3 + 0.7 * n * n) / CELL) * CELL);
+    flames.setMatrixAt(i, m.makeScale(1, h, 1).setPosition(c.x, CUBE / 2, c.z));
+  });
+  flames.instanceMatrix.needsUpdate = true;
+
+  coreMat.uniforms.uTime.value = flameTime;
+  coreMat.uniforms.uSize.value.set(0.9, 1.4).multiplyScalar(fire.scale.x * P.fire.core * energy);
+  coreMat.uniforms.uGlow.value = P.fire.coreGlow * flick;
+  light.intensity = P.fire.light * flick * energy;
+  sparkMat.uniforms.uTime.value = t;
+  sparkMat.uniforms.uAlive.value = P.sparks.amount + (stoke > 0 ? 1 - P.sparks.amount : P.sparks.amount) * stoke;
+
+  look.lerp(mouse, 1 - Math.exp(-dt * 3));
+  camera.position.set(
+    look.x * P.camera.mouse + Math.sin(t * 0.11) * P.camera.drift,
+    look.y * P.camera.mouse * 0.3 + Math.sin(t * 0.17) * P.camera.drift * 0.25,
+    Math.sin(t * 0.07) * P.camera.drift);
+  camera.lookAt(target);
+  tear.value = DH * Math.hypot(camera.position.x, camera.position.y) / (P.scene.eyeHeight * slope);
+
+  // Where the flames are on screen, for the haze.
+  camera.updateMatrixWorld();
+  const foot = v3.copy(fire.position).addScaledVector(up, CUBE / 2 * fire.scale.x).project(camera), footX = foot.x, footY = foot.y;
+  const reach = (v3.copy(fire.position).addScaledVector(up, (CUBE / 2 + flameTop) * fire.scale.x).project(camera).y - footY) / 2;
+  haze.uniforms.uBase.value.set(footX / 2 + 0.5, footY / 2 + 0.5);
+  haze.uniforms.uReach.value.set(reach * 0.5 / flameTop / camera.aspect, reach);
+  haze.uniforms.uTime.value = t;
+
+  composer.render(dt);
+});
+</script>
+</body>
+</html>
